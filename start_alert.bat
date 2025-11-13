@@ -1,7 +1,3 @@
-@REM start /min python C:\Users\Alexandr\Documents\LearnPython\TelegrAlert\pc_power_alert\power_alert.py
-
-@REM set TG_API_ID=38642593 && set TG_API_HASH=3455e166b9dfcee8f883e8ab4ae52ee6 && set TG_BOT_TOKEN=8333707550:AAEExWqLWk5LZrqOP7jhV7Ywo05ubc27dfs && set TG_CHAT_ID=484908554 && python power_alert.py
-
 @echo off
 chcp 65001 > nul
 
