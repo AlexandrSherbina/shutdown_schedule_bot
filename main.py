@@ -5,6 +5,7 @@ from logger import logger
 from telegram_client import TelegramClientWrapper
 from schedule_parser import ScheduleParser
 from date_parser import DateParser
+from interval_checker import IntervalChecker
 from message_builder import MessageBuilder
 from alert_manager import AlertManager
 import constants
@@ -14,17 +15,16 @@ async def main():
     """Главный цикл приложения."""
 
     try:
-        # Загружаем конфигурацию
         tg_config, alert_config = load_config()
         logger.info("✓ Конфигурация загружена")
     except ValueError as e:
         logger.error(f"{constants.ERROR_ENV_VARS_MISSING}\n{e}")
         return
 
-    # Инициализируем компоненты
     tg_client = TelegramClientWrapper(tg_config)
     parser = ScheduleParser(alert_config.target_queue)
-    date_parser = DateParser()  # ← НОВОЕ
+    date_parser = DateParser()
+    interval_checker = IntervalChecker()
     builder = MessageBuilder(
         alert_config.target_queue,
         alert_config.alert_minutes_before_off,
@@ -45,18 +45,14 @@ async def main():
                     if not message.message:
                         continue
 
-                    # ← НОВОЕ: Парсим дату из сообщения
                     schedule_date = date_parser.parse_date(message.message)
 
-                    # Проверяем, не устарел ли график
                     if not date_parser.is_schedule_valid(schedule_date):
                         logger.info(
                             f"Пропускаем устаревший график (сообщение ID: {message.id})")
                         continue
 
-                    # Устанавливаем дату в парсер
                     parser.set_schedule_date(schedule_date)
-
                     periods = parser.parse(message.message)
 
                     if not periods:
@@ -65,9 +61,25 @@ async def main():
                     logger.info(
                         f"Найден график на {schedule_date.strftime('%d.%m.%Y')} (ID: {message.id})")
 
+                    is_currently_offline = interval_checker.is_currently_offline(
+                        [(p[0], p[1]) for p in periods]
+                    )
+
+                    if is_currently_offline:
+                        current_period = interval_checker.get_current_offline_period(
+                            [(p[0], p[1]) for p in periods]
+                        )
+                        if current_period:
+                            logger.warning(
+                                f"⚠️ СЕЙЧАС ОТКЛЮЧЕНЫ! Интервал: {current_period[0]}-{current_period[1]}")
+                            msg = builder.current_offline_message(
+                                current_period[0], current_period[1]
+                            )
+                            alert_manager.send_alert(msg)
+
                     for period_start, period_end, apply_date in periods:
                         await process_period(
-                            alert_manager, builder, alert_config,
+                            alert_manager, builder, alert_config, interval_checker,
                             period_start, period_end, apply_date
                         )
 
@@ -84,12 +96,13 @@ async def main():
         await tg_client.disconnect()
 
 
-async def process_period(alert_manager, builder, alert_config, period_start, period_end, schedule_date):
+async def process_period(alert_manager, builder, alert_config, interval_checker,
+                         period_start, period_end, schedule_date):
     """Обрабатывает один период отключения/включения с учетом даты."""
 
     now_ts = time.time()
 
-    # ← ВАЖНО: Используем дату из графика, а не текущую дату!
+    # Используем дату из графика
     start_ts = time.mktime(time.strptime(
         f"{schedule_date.year}-{schedule_date.month:02d}-{schedule_date.day:02d} {period_start}:00",
         "%Y-%m-%d %H:%M:%S"
@@ -101,31 +114,42 @@ async def process_period(alert_manager, builder, alert_config, period_start, per
             f"Время {period_start} уже прошло для даты {schedule_date.strftime('%d.%m.%Y')}")
         return
 
-    # Отключение (OFF)
-    off_alert_ts = start_ts - (alert_config.alert_minutes_before_off * 60)
-    if off_alert_ts > now_ts + constants.MIN_ALERT_DELAY:
-        off_key = f"OFF_{schedule_date.strftime('%d.%m.%Y')}_{period_start}_{period_end}"
-        if off_key not in alert_manager.planned_alerts:
-            off_time = time.strftime('%H:%M', time.localtime(off_alert_ts))
-            msg = builder.initial_off_message(
-                period_start, period_end, off_time)
-            alert_manager.send_alert(msg)
-            alert_manager.planned_alerts.add(off_key)
+    # ← ПРОВЕРЯЕМ, НАХОДИМСЯ ЛИ МЫ В ТЕКУЩЕМ ИНТЕРВАЛЕ
+    is_in_current_interval = interval_checker.is_in_interval(
+        period_start, period_end)
 
-            final_msg = builder.final_off_message(period_start, period_end)
-            delay = off_alert_ts - now_ts
-            asyncio.create_task(
-                alert_manager.schedule_delayed_alert(
-                    'OFF', delay, final_msg, off_key)
-            )
+    if is_in_current_interval:
+        logger.info(
+            f"Мы находимся в интервале отключения {period_start}-{period_end}")
+        # НЕ ВЫХОДИМ! Продолжаем обработку напоминания о включении
+    else:
+        # ← ОТКЛЮЧЕНИЕ (OFF) - только если НЕ в текущем интервале
+        off_alert_ts = start_ts - (alert_config.alert_minutes_before_off * 60)
+        if off_alert_ts > now_ts + constants.MIN_ALERT_DELAY:
+            off_key = f"OFF_{schedule_date.strftime('%d.%m.%Y')}_{period_start}_{period_end}"
+            if off_key not in alert_manager.planned_alerts:
+                off_time = time.strftime('%H:%M', time.localtime(off_alert_ts))
+                msg = builder.initial_off_message(
+                    period_start, period_end, off_time)
+                alert_manager.send_alert(msg)
+                alert_manager.planned_alerts.add(off_key)
 
-    # Включение (ON)
+                final_msg = builder.final_off_message(period_start, period_end)
+                delay = off_alert_ts - now_ts
+                asyncio.create_task(
+                    alert_manager.schedule_delayed_alert(
+                        'OFF', delay, final_msg, off_key)
+                )
+
+    # ← ВКЛЮЧЕНИЕ (ON) - ВСЕГДА обрабатываем, даже если в текущем интервале!
     end_ts = time.mktime(time.strptime(
         f"{schedule_date.year}-{schedule_date.month:02d}-{schedule_date.day:02d} {period_end}:00",
         "%Y-%m-%d %H:%M:%S"
     ))
 
     on_alert_ts = end_ts - (alert_config.alert_minutes_before_on * 60)
+
+    # Проверяем, что напоминание о включении еще не прошло
     if on_alert_ts > now_ts + constants.MIN_ALERT_DELAY:
         on_key = f"ON_{schedule_date.strftime('%d.%m.%Y')}_{period_start}_{period_end}"
         if on_key not in alert_manager.planned_alerts:
@@ -136,10 +160,16 @@ async def process_period(alert_manager, builder, alert_config, period_start, per
 
             final_msg = builder.final_on_message(period_end)
             delay = on_alert_ts - now_ts
+
+            logger.info(f"Запланировано напоминание о включении в {period_end} "
+                        f"(через {int(delay / 60)} мин)")
+
             asyncio.create_task(
                 alert_manager.schedule_delayed_alert(
                     'ON', delay, final_msg, on_key)
             )
+    else:
+        logger.debug(f"Напоминание о включении {period_end} уже прошло")
 
 
 if __name__ == '__main__':
