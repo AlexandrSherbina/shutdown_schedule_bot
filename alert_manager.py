@@ -12,16 +12,42 @@ class AlertManager:
         self.bot_token = bot_token
         self.chat_id = chat_id
         self.api_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        self.sent_hashes = set()
+        self.sent_hashes = set()  # Хеши отправленных сообщений
+        self.sent_keys = set()    # ← НОВОЕ: ключи отправленных сообщений
         self.planned_alerts = set()
 
-    def send_alert(self, message_text: str) -> bool:
-        """Отправляет сообщение (с проверкой на дубликаты)."""
+    def _get_message_hash(self, message_text: str) -> str:
+        """Генерирует хеш сообщения."""
+        return hashlib.md5(message_text.encode()).hexdigest()
 
-        msg_hash = hashlib.md5(message_text.encode()).hexdigest()
+    def _is_duplicate_sent_today(self, message_text: str) -> bool:
+        """Проверяет, было ли это сообщение отправлено сегодня."""
+        msg_hash = self._get_message_hash(message_text)
 
         if msg_hash in self.sent_hashes:
-            logger.debug("Сообщение уже было отправлено, пропускаем дубликат")
+            logger.debug(
+                f"Сообщение уже было отправлено. Пропускаем дубликат.")
+            return True
+
+        return False
+
+    def send_alert(self, message_text: str, force: bool = False, alert_key: str = None) -> bool:
+        """
+        Отправляет сообщение (с проверкой на дубликаты).
+
+        Args:
+            message_text: Текст сообщения
+            force: Если True — отправить, несмотря на дубликаты
+            alert_key: Уникальный ключ сообщения (для отслеживания)
+        """
+
+        # ← НОВОЕ: Проверка по ключу (более надежная)
+        if alert_key and alert_key in self.sent_keys:
+            logger.debug(f"Сообщение {alert_key} уже отправлено. Пропускаем.")
+            return False
+
+        # Проверка на дубликаты (если не force)
+        if not force and self._is_duplicate_sent_today(message_text):
             return False
 
         try:
@@ -34,13 +60,26 @@ class AlertManager:
             response = requests.post(self.api_url, data=payload, timeout=10)
             response.raise_for_status()
 
+            # Добавляем в набор отправленных
+            msg_hash = self._get_message_hash(message_text)
             self.sent_hashes.add(msg_hash)
+
+            # ← НОВОЕ: Добавляем ключ
+            if alert_key:
+                self.sent_keys.add(alert_key)
+
             logger.info("✓ Уведомление отправлено")
             return True
 
         except requests.exceptions.RequestException as e:
             logger.error(f"Ошибка отправки: {e}")
             return False
+
+    def clear_daily_cache(self):
+        """Очищает кеш отправленных сообщений (вызывать раз в день)."""
+        self.sent_hashes.clear()
+        self.sent_keys.clear()
+        logger.info("✓ Кеш отправленных сообщений очищен")
 
     async def schedule_delayed_alert(self, alert_type: str, delay_seconds: float,
                                      message: str, alert_key: str) -> None:
@@ -50,7 +89,7 @@ class AlertManager:
             logger.info(
                 f"Планирование {alert_type} через {int(delay_seconds // 60)} мин")
             await asyncio.sleep(delay_seconds)
-            self.send_alert(message)
+            self.send_alert(message, force=True, alert_key=alert_key)
             self.planned_alerts.discard(alert_key)
 
         except asyncio.CancelledError:

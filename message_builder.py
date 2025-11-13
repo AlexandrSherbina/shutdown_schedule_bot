@@ -10,11 +10,11 @@ class MessageBuilder:
         self.alert_on_minutes = alert_on_minutes
 
     def current_offline_message(self, period_start: str, period_end: str) -> str:
-        """Сообщение о текущем отключении (прямо сейчас)."""
+        """Сообщение о текущем отключении (прямо сейчас) — БЕЗ динамического времени."""
         return (
             f"🚨 *ВНИМАНИЕ! СЕЙЧАС ОТКЛЮЧЕНЫ!* 🚨\n\n"
             f"Ваша очередь **{self.target_queue}** отключена прямо сейчас.\n"
-            f"⏰ Включение в *{period_end}* (осталось ~ {self._get_time_until(period_end)} мин)"
+            f"⏰ Включение в *{period_end}*"
         )
 
     def initial_off_message(self, period_start: str, period_end: str, alert_time: str) -> str:
@@ -46,18 +46,3 @@ class MessageBuilder:
             f"💡 *СВЕТ ВКЛЮЧАТ ЧЕРЕЗ {self.alert_on_minutes} МИНУТ!* 🎉\n\n"
             f"Плановое *включение* в {period_end} для очереди {self.target_queue}."
         )
-
-    def _get_time_until(self, end_time: str) -> int:
-        """Вспомогательный метод для расчета минут до конца интервала."""
-        from datetime import datetime
-
-        end_hour, end_minute = map(int, end_time.split(':'))
-        end_datetime = datetime.now().replace(hour=end_hour, minute=end_minute, second=0)
-
-        # Если время уже прошло — добавляем 24 часа
-        if end_datetime < datetime.now():
-            from datetime import timedelta
-            end_datetime += timedelta(days=1)
-
-        delta = (end_datetime - datetime.now()).total_seconds() / 60
-        return int(delta)

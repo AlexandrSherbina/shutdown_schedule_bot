@@ -1,5 +1,6 @@
 import asyncio
 import time
+from datetime import datetime
 from config import load_config
 from logger import logger
 from telegram_client import TelegramClientWrapper
@@ -32,6 +33,8 @@ async def main():
     )
     alert_manager = AlertManager(tg_config.bot_token, tg_config.chat_id)
 
+    last_day = None  # Отслеживаем день для очистки кеша
+
     try:
         await tg_client.connect()
         channel = await tg_client.get_channel()
@@ -39,6 +42,12 @@ async def main():
 
         while True:
             try:
+                # ← НОВОЕ: Очищаем кеш в полночь
+                current_day = datetime.now().day
+                if last_day is not None and last_day != current_day:
+                    alert_manager.clear_daily_cache()
+                last_day = current_day
+
                 messages = await tg_client.get_recent_messages(channel)
 
                 for message in messages:
@@ -75,7 +84,15 @@ async def main():
                             msg = builder.current_offline_message(
                                 current_period[0], current_period[1]
                             )
-                            alert_manager.send_alert(msg)
+                            # ← НОВОЕ: Используем уникальный ключ
+                            current_offline_key = f"CURRENT_OFFLINE_{schedule_date.strftime('%d.%m.%Y')}_{current_period[0]}_{current_period[1]}"
+
+                            if alert_manager.send_alert(msg, alert_key=current_offline_key):
+                                logger.info(
+                                    "Сообщение о текущем отключении отправлено")
+                            else:
+                                logger.debug(
+                                    "Сообщение уже было отправлено ранее")
 
                     for period_start, period_end, apply_date in periods:
                         await process_period(
@@ -102,28 +119,24 @@ async def process_period(alert_manager, builder, alert_config, interval_checker,
 
     now_ts = time.time()
 
-    # Используем дату из графика
     start_ts = time.mktime(time.strptime(
         f"{schedule_date.year}-{schedule_date.month:02d}-{schedule_date.day:02d} {period_start}:00",
         "%Y-%m-%d %H:%M:%S"
     ))
 
-    # Если время уже прошло — пропускаем
     if start_ts < now_ts:
         logger.debug(
             f"Время {period_start} уже прошло для даты {schedule_date.strftime('%d.%m.%Y')}")
         return
 
-    # ← ПРОВЕРЯЕМ, НАХОДИМСЯ ЛИ МЫ В ТЕКУЩЕМ ИНТЕРВАЛЕ
     is_in_current_interval = interval_checker.is_in_interval(
         period_start, period_end)
 
     if is_in_current_interval:
         logger.info(
             f"Мы находимся в интервале отключения {period_start}-{period_end}")
-        # НЕ ВЫХОДИМ! Продолжаем обработку напоминания о включении
     else:
-        # ← ОТКЛЮЧЕНИЕ (OFF) - только если НЕ в текущем интервале
+        # ← ОТКЛЮЧЕНИЕ (OFF)
         off_alert_ts = start_ts - (alert_config.alert_minutes_before_off * 60)
         if off_alert_ts > now_ts + constants.MIN_ALERT_DELAY:
             off_key = f"OFF_{schedule_date.strftime('%d.%m.%Y')}_{period_start}_{period_end}"
@@ -131,17 +144,20 @@ async def process_period(alert_manager, builder, alert_config, interval_checker,
                 off_time = time.strftime('%H:%M', time.localtime(off_alert_ts))
                 msg = builder.initial_off_message(
                     period_start, period_end, off_time)
-                alert_manager.send_alert(msg)
-                alert_manager.planned_alerts.add(off_key)
 
-                final_msg = builder.final_off_message(period_start, period_end)
-                delay = off_alert_ts - now_ts
-                asyncio.create_task(
-                    alert_manager.schedule_delayed_alert(
-                        'OFF', delay, final_msg, off_key)
-                )
+                # ← ПРОВЕРКА НА ДУБЛИКАТ с ключом
+                if alert_manager.send_alert(msg, alert_key=off_key):
+                    alert_manager.planned_alerts.add(off_key)
 
-    # ← ВКЛЮЧЕНИЕ (ON) - ВСЕГДА обрабатываем, даже если в текущем интервале!
+                    final_msg = builder.final_off_message(
+                        period_start, period_end)
+                    delay = off_alert_ts - now_ts
+                    asyncio.create_task(
+                        alert_manager.schedule_delayed_alert(
+                            'OFF', delay, final_msg, off_key)
+                    )
+
+    # ← ВКЛЮЧЕНИЕ (ON)
     end_ts = time.mktime(time.strptime(
         f"{schedule_date.year}-{schedule_date.month:02d}-{schedule_date.day:02d} {period_end}:00",
         "%Y-%m-%d %H:%M:%S"
@@ -149,25 +165,26 @@ async def process_period(alert_manager, builder, alert_config, interval_checker,
 
     on_alert_ts = end_ts - (alert_config.alert_minutes_before_on * 60)
 
-    # Проверяем, что напоминание о включении еще не прошло
     if on_alert_ts > now_ts + constants.MIN_ALERT_DELAY:
         on_key = f"ON_{schedule_date.strftime('%d.%m.%Y')}_{period_start}_{period_end}"
         if on_key not in alert_manager.planned_alerts:
             on_time = time.strftime('%H:%M', time.localtime(on_alert_ts))
             msg = builder.initial_on_message(period_end, on_time)
-            alert_manager.send_alert(msg)
-            alert_manager.planned_alerts.add(on_key)
 
-            final_msg = builder.final_on_message(period_end)
-            delay = on_alert_ts - now_ts
+            # ← ПРОВЕРКА НА ДУБЛИКАТ с ключом
+            if alert_manager.send_alert(msg, alert_key=on_key):
+                alert_manager.planned_alerts.add(on_key)
 
-            logger.info(f"Запланировано напоминание о включении в {period_end} "
-                        f"(через {int(delay / 60)} мин)")
+                final_msg = builder.final_on_message(period_end)
+                delay = on_alert_ts - now_ts
 
-            asyncio.create_task(
-                alert_manager.schedule_delayed_alert(
-                    'ON', delay, final_msg, on_key)
-            )
+                logger.info(f"Запланировано напоминание о включении в {period_end} "
+                            f"(через {int(delay / 60)} мин)")
+
+                asyncio.create_task(
+                    alert_manager.schedule_delayed_alert(
+                        'ON', delay, final_msg, on_key)
+                )
     else:
         logger.debug(f"Напоминание о включении {period_end} уже прошло")
 
