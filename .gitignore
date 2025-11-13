@@ -1,0 +1,12 @@
+env.env
+.env
+.env.local
+*.pid
+logs/
+*.log
+__pycache__/
+*.pyc
+*.session
+*.session-journal
+power_alert_session*
+.DS_Store
