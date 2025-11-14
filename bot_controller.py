@@ -31,37 +31,51 @@ class BotController:
         self.offset = None
         self.running = True
 
+    def _escape_markdown(self, text: str) -> str:
+        """Экранирует спецсимволы для MarkdownV2."""
+        # Экранируем спецсимволы Markdown
+        special_chars = r'_*[]()~`>#+-=|{}.!'
+        for char in special_chars:
+            text = text.replace(char, '\\' + char)
+        return text
+
     def _send(self, chat_id: int, text: str):
-        """Отправляет сообщение, логирует ошибку тела ответа и при ошибке ретраит без parse_mode."""
+        """Отправляет сообщение без parse_mode (или с экранированием)."""
         try:
+            # Вариант 1: БЕЗ parse_mode (самый безопасный)
             payload = {
                 "chat_id": chat_id,
-                "text": text,
-                "parse_mode": "Markdown"
+                "text": text
             }
             r = requests.post(f"{self.api_base}/sendMessage",
                               data=payload, timeout=10)
             r.raise_for_status()
+            logger.debug(f"✓ Сообщение отправлено")
             return True
         except requests.exceptions.HTTPError as e:
-            # логируем тело ответа (Telegram даёт описание ошибки)
-            try:
-                logger.error(f"Bot send error: {e} - response: {r.text}")
-            except Exception:
-                logger.error(f"Bot send error: {e}")
-            # повторная попытка — без parse_mode (без Markdown)
-            try:
-                payload = {"chat_id": chat_id, "text": text}
-                r2 = requests.post(
-                    f"{self.api_base}/sendMessage", data=payload, timeout=10)
-                r2.raise_for_status()
-                logger.info("Bot send retry without parse_mode succeeded")
-                return True
-            except Exception as e2:
-                logger.error(f"Bot send retry failed: {e2}")
-                return False
+            logger.error(f"Bot send error: {e} - response: {r.text}")
+            return False
         except Exception as e:
             logger.error(f"Bot send error: {e}")
+            return False
+
+    # АЛЬТЕРНАТИВНЫЙ метод с экранированием (если нужен Markdown):
+    def _send_markdown(self, chat_id: int, text: str):
+        """Отправляет сообщение с экранированным MarkdownV2."""
+        try:
+            escaped_text = self._escape_markdown(text)
+            payload = {
+                "chat_id": chat_id,
+                "text": escaped_text,
+                "parse_mode": "MarkdownV2"
+            }
+            r = requests.post(f"{self.api_base}/sendMessage",
+                              data=payload, timeout=10)
+            r.raise_for_status()
+            logger.debug(f"✓ Сообщение отправлено (Markdown)")
+            return True
+        except Exception as e:
+            logger.error(f"Bot send markdown error: {e}")
             return False
 
     def _is_admin(self, upd) -> bool:
@@ -86,12 +100,12 @@ class BotController:
 
     def _format_status(self) -> str:
         return (
-            f"*Статус приложения*\n\n"
-            f"Очередь: `{self.alert_config.target_queue}`\n"
-            f"Оповещение до ОТКЛЮЧЕНИЯ: `{self.alert_config.alert_minutes_before_off}` мин\n"
-            f"Оповещение до ВКЛЮЧЕНИЯ: `{self.alert_config.alert_minutes_before_on}` мин\n"
-            f"Интервал проверки: `{self.alert_config.check_interval_seconds}` сек\n"
-            f"Запланировано оповещений: `{len(self.alert_manager.planned_alerts)}`"
+            f"Статус приложения\n\n"
+            f"Очередь: {self.alert_config.target_queue}\n"
+            f"Оповещение до ОТКЛЮЧЕНИЯ: {self.alert_config.alert_minutes_before_off} мин\n"
+            f"Оповещение до ВКЛЮЧЕНИЯ: {self.alert_config.alert_minutes_before_on} мин\n"
+            f"Интервал проверки: {self.alert_config.check_interval_seconds} сек\n"
+            f"Запланировано оповещений: {len(self.alert_manager.planned_alerts)}"
         )
 
     def _format_planned(self) -> str:
@@ -104,12 +118,11 @@ class BotController:
 
     def _handle_command(self, upd):
         try:
-            # извлекаем message безопасно
-            msg = upd.get('message') or upd.get('edited_message') or {}
             if not self._is_admin(upd):
                 logger.debug("Отказано: команда не от администратора")
                 return
 
+            msg = upd.get('message') or upd.get('edited_message') or {}
             chat_id = (msg.get('chat') or {}).get(
                 'id') or (msg.get('from') or {}).get('id')
             if not chat_id:
@@ -141,33 +154,32 @@ class BotController:
 
             if cmd == '/set_queue' and len(parts) >= 2:
                 new_q = parts[1]
-                # меняем в parser и в конфиг
                 try:
                     self.parser.target_queue = new_q
                 except Exception:
                     pass
                 self.alert_config.target_queue = new_q
-                self._send(chat_id, f"Очередь установлена: `{new_q}`")
+                self._send(chat_id, f"Очередь установлена: {new_q}")
                 return
 
             if cmd == '/set_off' and len(parts) >= 2:
                 try:
                     val = int(parts[1])
                     self.alert_config.alert_minutes_before_off = val
-                    self._send(chat_id, f"Апдейт: ALERT_OFF_MINUTES = `{val}`")
+                    self._send(chat_id, f"ALERT_OFF_MINUTES = {val} минут")
                 except ValueError:
                     self._send(
-                        chat_id, "Неверный формат. Используйте целое число минут.")
+                        chat_id, "Ошибка: используйте целое число минут")
                 return
 
             if cmd == '/set_on' and len(parts) >= 2:
                 try:
                     val = int(parts[1])
                     self.alert_config.alert_minutes_before_on = val
-                    self._send(chat_id, f"Апдейт: ALERT_ON_MINUTES = `{val}`")
+                    self._send(chat_id, f"ALERT_ON_MINUTES = {val} минут")
                 except ValueError:
                     self._send(
-                        chat_id, "Неверный формат. Используйте целое число минут.")
+                        chat_id, "Ошибка: используйте целое число минут")
                 return
 
             if cmd == '/planned':
@@ -176,29 +188,23 @@ class BotController:
 
             if cmd == '/cancel_date' and len(parts) >= 2:
                 date_key = parts[1]
-                # Ожидаем формат DD.MM.YYYY
                 try:
+                    from datetime import datetime
                     datetime.strptime(date_key, "%d.%m.%Y")
                 except Exception:
                     self._send(
-                        chat_id, "Неверный формат даты. Используйте DD.MM.YYYY")
+                        chat_id, "Ошибка: используйте формат DD.MM.YYYY")
                     return
                 self.alert_manager.cancel_planned_for_date(date_key)
-                # удаляем запись last_schedule_updates
                 self.last_schedule_updates.pop(date_key, None)
-                self._send(
-                    chat_id, f"Отменены планы и очищены ключи для {date_key}")
+                self._send(chat_id, f"Отменены планы для {date_key}")
                 return
 
             if cmd == '/reload':
-                # Отменяем все, очищаем кешы
                 try:
                     self.alert_manager.cancel_all_planned()
                 except Exception:
-                    # fallback: отменить по каждой дате в planned
                     for k in list(self.alert_manager.planned_alerts):
-                        # попытка извлечь дату_key из ключа
-                        # ключи форматов: OFF_dd.mm.YYYY_..., ON_..., CURRENT_OFFLINE_dd.mm.YYYY_...
                         parts_k = k.split('_')
                         if len(parts_k) >= 2:
                             date_key = parts_k[1]
@@ -207,11 +213,10 @@ class BotController:
                 self.alert_manager.clear_daily_cache()
                 self.last_schedule_updates.clear()
                 self._send(
-                    chat_id, "Перезагрузка: отменены все планы, очищен кеш.")
+                    chat_id, "Перезагрузка: отменены все планы, кеш очищен")
                 return
 
-            # неизвестная команда
-            self._send(chat_id, "Неизвестная команда. /help для списка.")
+            self._send(chat_id, "Неизвестная команда. /help для списка")
         except Exception as e:
             logger.exception(f"Ошибка обработки команды: {e}")
 
