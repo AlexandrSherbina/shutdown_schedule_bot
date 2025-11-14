@@ -110,19 +110,30 @@ class AlertManager:
 
     def cancel_planned_for_date(self, date_key: str):
         """
-        Отменяет все запланированные оповещения и удаляет ключи отправленных сообщений,
-        содержащие date_key (строка вида 'dd.mm.YYYY').
+        Отменяет все запланированные оповещения и очищает связанные sent_keys для указанной даты.
+        date_key формат: 'dd.mm.YYYY'
         """
         logger.info(f"Отмена запланированных оповещений для {date_key}")
-        # отменяем задачи и удаляем ключи planned_alerts
+        # отменяем задачи
         for key in list(self.planned_alerts):
             if date_key in key:
                 task = self.scheduled_tasks.pop(key, None)
                 if task and not task.done():
                     task.cancel()
                 self.planned_alerts.discard(key)
-        # очищаем sent_keys связанные с этой датой (чтобы новые сообщения после изменения могли отправиться)
+        # очищаем sent_keys связанные с датой (позволит отправить новые сообщения после изменения)
         for k in list(self.sent_keys):
             if date_key in k:
                 self.sent_keys.discard(k)
         logger.info(f"Отмена завершена для {date_key}")
+
+    def cancel_all_planned(self):
+        """Отменяет все запланированные оповещения и очищает ключи/таски."""
+        logger.info("Отмена всех запланированных оповещений")
+        for key in list(self.planned_alerts):
+            task = self.scheduled_tasks.pop(key, None)
+            if task and not task.done():
+                task.cancel()
+            self.planned_alerts.discard(key)
+        self.sent_keys.clear()
+        logger.info("Все запланированные оповещения отменены")

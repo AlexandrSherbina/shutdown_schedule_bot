@@ -33,9 +33,17 @@ async def main():
     )
     alert_manager = AlertManager(tg_config.bot_token, tg_config.chat_id)
 
-    last_day = None  # Отслеживаем день для очистки кеша
+    # ИНИЦИАЛИЗАЦИЯ СОСТОЯНИЯ ДЛЯ БОТА — ДОЛЖНА БЫТЬ ДО СОЗДАНИЯ BotController
     # ключ: 'dd.mm.YYYY' -> datetime последнего обработанного обновления
     last_schedule_updates = {}
+
+    # Запуск контроллера бота (async task)
+    from bot_controller import BotController
+    bot_ctrl = BotController(tg_config.bot_token, tg_config.chat_id,
+                             parser, alert_manager, alert_config, last_schedule_updates)
+    asyncio.create_task(bot_ctrl.run())
+
+    last_day = None  # Отслеживаем день для очистки кеша
 
     try:
         await tg_client.connect()
