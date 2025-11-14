@@ -32,21 +32,55 @@ class BotController:
         self.running = True
 
     def _send(self, chat_id: int, text: str):
+        """Отправляет сообщение, логирует ошибку тела ответа и при ошибке ретраит без parse_mode."""
         try:
-            resp = requests.post(f"{self.api_base}/sendMessage", data={
+            payload = {
                 "chat_id": chat_id,
                 "text": text,
                 "parse_mode": "Markdown"
-            }, timeout=10)
-            resp.raise_for_status()
+            }
+            r = requests.post(f"{self.api_base}/sendMessage",
+                              data=payload, timeout=10)
+            r.raise_for_status()
             return True
+        except requests.exceptions.HTTPError as e:
+            # логируем тело ответа (Telegram даёт описание ошибки)
+            try:
+                logger.error(f"Bot send error: {e} - response: {r.text}")
+            except Exception:
+                logger.error(f"Bot send error: {e}")
+            # повторная попытка — без parse_mode (без Markdown)
+            try:
+                payload = {"chat_id": chat_id, "text": text}
+                r2 = requests.post(
+                    f"{self.api_base}/sendMessage", data=payload, timeout=10)
+                r2.raise_for_status()
+                logger.info("Bot send retry without parse_mode succeeded")
+                return True
+            except Exception as e2:
+                logger.error(f"Bot send retry failed: {e2}")
+                return False
         except Exception as e:
             logger.error(f"Bot send error: {e}")
             return False
 
-    def _is_admin(self, msg):
+    def _is_admin(self, upd) -> bool:
+        """Более надёжная проверка администратора по разным типам апдейтов."""
         try:
-            return int(msg['message']['from']['id']) == self.admin_chat_id or int(msg['message']['chat']['id']) == self.admin_chat_id
+            # поддерживаем разные структуры апдейта
+            msg = upd.get('message') or upd.get('edited_message') or upd.get(
+                'callback_query', {}).get('message')
+            from_id = None
+            chat_id = None
+            if msg:
+                from_id = (msg.get('from') or {}).get('id')
+                chat_id = (msg.get('chat') or {}).get('id')
+            # fallback: callback_query.from
+            if from_id is None and upd.get('callback_query'):
+                from_id = (upd['callback_query'].get('from') or {}).get('id')
+            if from_id is None:
+                return False
+            return int(from_id) == self.admin_chat_id or (chat_id is not None and int(chat_id) == self.admin_chat_id)
         except Exception:
             return False
 
@@ -70,16 +104,21 @@ class BotController:
 
     def _handle_command(self, upd):
         try:
+            # извлекаем message безопасно
+            msg = upd.get('message') or upd.get('edited_message') or {}
             if not self._is_admin(upd):
                 logger.debug("Отказано: команда не от администратора")
                 return
 
-            msg = upd['message']
-            chat_id = msg['chat']['id']
+            chat_id = (msg.get('chat') or {}).get(
+                'id') or (msg.get('from') or {}).get('id')
+            if not chat_id:
+                logger.debug("Не удалось определить chat_id для ответа")
+                return
+
             text = msg.get('text', '').strip()
             if not text:
                 return
-
             parts = text.split()
             cmd = parts[0].lower()
 

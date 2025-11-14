@@ -16,6 +16,7 @@ async def main():
     """Главный цикл приложения."""
 
     try:
+        logger.info("Загружаю конфигурацию...")
         tg_config, alert_config = load_config()
         logger.info("✓ Конфигурация загружена")
     except ValueError as e:
@@ -33,23 +34,46 @@ async def main():
     )
     alert_manager = AlertManager(tg_config.bot_token, tg_config.chat_id)
 
-    # ИНИЦИАЛИЗАЦИЯ СОСТОЯНИЯ ДЛЯ БОТА — ДОЛЖНА БЫТЬ ДО СОЗДАНИЯ BotController
-    # ключ: 'dd.mm.YYYY' -> datetime последнего обработанного обновления
+    last_day = None
     last_schedule_updates = {}
 
     # Запуск контроллера бота (async task)
-    from bot_controller import BotController
-    bot_ctrl = BotController(tg_config.bot_token, tg_config.chat_id,
-                             parser, alert_manager, alert_config, last_schedule_updates)
-    asyncio.create_task(bot_ctrl.run())
-
-    last_day = None  # Отслеживаем день для очистки кеша
+    try:
+        logger.info("Инициализирую BotController...")
+        from bot_controller import BotController
+        bot_ctrl = BotController(tg_config.bot_token, tg_config.chat_id,
+                                 parser, alert_manager, alert_config, last_schedule_updates)
+        bot_task = asyncio.create_task(bot_ctrl.run())
+        logger.info("✓ BotController запущен в фоне")
+    except Exception as e:
+        logger.error(f"Ошибка инициализации BotController: {e}")
+        bot_task = None
 
     try:
-        await tg_client.connect()
-        channel = await tg_client.get_channel()
-        logger.info(f"Отслеживается очередь: {alert_config.target_queue}")
+        logger.info("Подключаюсь к Telegram...")
+        await asyncio.wait_for(tg_client.connect(), timeout=10)
+        logger.info("✓ Подключено к Telegram")
+    except asyncio.TimeoutError:
+        logger.error("Таймаут подключения к Telegram (10 сек)")
+        return
+    except Exception as e:
+        logger.error(f"Ошибка подключения к Telegram: {e}")
+        return
 
+    try:
+        logger.info("Получаю канал...")
+        channel = await asyncio.wait_for(tg_client.get_channel(), timeout=10)
+        logger.info(f"✓ Отслеживается очередь: {alert_config.target_queue}")
+    except asyncio.TimeoutError:
+        logger.error("Таймаут получения канала (10 сек)")
+        await tg_client.disconnect()
+        return
+    except Exception as e:
+        logger.error(f"Ошибка получения канала: {e}")
+        await tg_client.disconnect()
+        return
+
+    try:
         while True:
             try:
                 # очистка кеша в полночь
@@ -59,53 +83,47 @@ async def main():
                     last_schedule_updates.clear()
                 last_day = current_day
 
-                messages = await tg_client.get_recent_messages(channel)
+                logger.debug("Получаю последние сообщения...")
+                messages = await asyncio.wait_for(tg_client.get_recent_messages(channel), timeout=15)
+                logger.debug(f"Получено {len(messages)} сообщений")
 
                 for message in messages:
                     if not message.message:
                         continue
 
-                    # parse_date теперь возвращает (schedule_date, update_dt)
                     schedule_date, update_dt = date_parser.parse_date(
                         message.message)
                     date_key = schedule_date.strftime('%d.%m.%Y')
 
-                    # если уже есть сохранённое время обновления — сравниваем
                     prev_update = last_schedule_updates.get(date_key)
 
-                    # если в сообщении нет времени обновления, считаем его "ненулевым" — обрабатываем только если нет prev_update
                     if update_dt is None and prev_update is not None:
-                        # уже обработана более точная версия — пропускаем
                         logger.debug(
-                            f"Пропускаем сообщение без времени обновления для {date_key} (уже есть обновление)")
+                            f"Пропускаю сообщение без времени обновления для {date_key}")
                         continue
 
-                    # если есть предыдущее и текущее update_dt <= prev_update — пропускаем (старое сообщение)
                     if update_dt is not None and prev_update is not None and update_dt <= prev_update:
                         logger.debug(
-                            f"Пропускаем старое обновление для {date_key} ({update_dt} <= {prev_update})")
+                            f"Пропускаю старое обновление для {date_key}")
                         continue
 
-                    # если пришло новое обновление (update_dt > prev_update) — нужно отменить старые планы для этой даты
                     if prev_update is not None and (update_dt is None or update_dt > prev_update):
                         logger.info(
-                            f"Найдено новое обновление графика для {date_key}. Отменяю старые планы.")
+                            f"Новое обновление графика для {date_key}. Отменяю старые планы.")
                         alert_manager.cancel_planned_for_date(date_key)
 
-                    # сохраняем время последней обработки (если есть) - если нет, помечаем текущим временем
                     last_schedule_updates[date_key] = update_dt or datetime.now(
                     )
 
-                    # далее логика парсинга периодов и планирования (как раньше)
                     parser.set_schedule_date(schedule_date)
                     periods = parser.parse(message.message)
+
                     if not periods:
                         continue
 
                     logger.info(
                         f"Найден график на {date_key} (ID: {message.id})")
 
-                    # ← ИСПРАВЛЕННО: Передаём полные periods (с apply_date)
                     is_currently_offline = interval_checker.is_currently_offline(
                         periods)
 
@@ -113,7 +131,6 @@ async def main():
                         current_period = interval_checker.get_current_offline_period(
                             periods)
                         if current_period:
-                            # ← current_period теперь (start, end, apply_date)
                             period_start, period_end, apply_date = current_period
                             apply_date_key = apply_date.strftime('%d.%m.%Y') if hasattr(
                                 apply_date, 'strftime') else str(apply_date)
@@ -140,12 +157,24 @@ async def main():
 
                 await asyncio.sleep(alert_config.check_interval_seconds)
 
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Таймаут при получении сообщений (15 сек), продолжаю...")
+                await asyncio.sleep(10)
             except Exception as e:
                 logger.error(f"Ошибка в цикле: {e}")
                 await asyncio.sleep(60)
 
+    except KeyboardInterrupt:
+        logger.info("Получен сигнал прерывания (Ctrl+C)")
+    except Exception as e:
+        logger.error(f"Критическая ошибка: {e}")
     finally:
+        logger.info("Отключаюсь от Telegram...")
         await tg_client.disconnect()
+        if bot_task:
+            bot_task.cancel()
+        logger.info("✓ Приложение остановлено")
 
 
 async def process_period(alert_manager, builder, alert_config, interval_checker,
@@ -164,16 +193,15 @@ async def process_period(alert_manager, builder, alert_config, interval_checker,
             f"Время {period_start} уже прошло для даты {schedule_date.strftime('%d.%m.%Y')}")
         return
 
-    # ← ИСПРАВЛЕННО: Передаём schedule_date в is_in_interval
     is_in_current_interval = interval_checker.is_in_interval(
         period_start, period_end, schedule_date)
 
     if is_in_current_interval:
         logger.info(
             f"Мы находимся в интервале отключения {period_start}-{period_end} на {schedule_date.strftime('%d.%m.%Y')}")
-        return  # ← Пропускаем, не обрабатываем текущий интервал
+        return
 
-    # ← ОТКЛЮЧЕНИЕ (OFF)
+    # ОТКЛЮЧЕНИЕ (OFF)
     off_alert_ts = start_ts - (alert_config.alert_minutes_before_off * 60)
     if off_alert_ts > now_ts + constants.MIN_ALERT_DELAY:
         off_key = f"OFF_{schedule_date.strftime('%d.%m.%Y')}_{period_start}_{period_end}"
@@ -182,7 +210,6 @@ async def process_period(alert_manager, builder, alert_config, interval_checker,
             msg = builder.initial_off_message(
                 period_start, period_end, off_time)
 
-            # ← ПРОВЕРКА НА ДУБЛИКАТ с ключом
             if alert_manager.send_alert(msg, alert_key=off_key):
                 alert_manager.planned_alerts.add(off_key)
 
@@ -194,7 +221,7 @@ async def process_period(alert_manager, builder, alert_config, interval_checker,
                         'OFF', delay, final_msg, off_key)
                 )
 
-    # ← ВКЛЮЧЕНИЕ (ON)
+    # ВКЛЮЧЕНИЕ (ON)
     end_ts = time.mktime(time.strptime(
         f"{schedule_date.year}-{schedule_date.month:02d}-{schedule_date.day:02d} {period_end}:00",
         "%Y-%m-%d %H:%M:%S"
@@ -208,7 +235,6 @@ async def process_period(alert_manager, builder, alert_config, interval_checker,
             on_time = time.strftime('%H:%M', time.localtime(on_alert_ts))
             msg = builder.initial_on_message(period_end, on_time)
 
-            # ← ПРОВЕРКА НА ДУБЛИКАТ с ключом
             if alert_manager.send_alert(msg, alert_key=on_key):
                 alert_manager.planned_alerts.add(on_key)
 
