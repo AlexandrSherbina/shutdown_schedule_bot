@@ -15,6 +15,7 @@ class AlertManager:
         self.sent_hashes = set()  # Хеши отправленных сообщений
         self.sent_keys = set()    # ← НОВОЕ: ключи отправленных сообщений
         self.planned_alerts = set()
+        self.scheduled_tasks = {}  # alert_key -> asyncio.Task
 
     def _get_message_hash(self, message_text: str) -> str:
         """Генерирует хеш сообщения."""
@@ -83,16 +84,45 @@ class AlertManager:
 
     async def schedule_delayed_alert(self, alert_type: str, delay_seconds: float,
                                      message: str, alert_key: str) -> None:
-        """Планирует отложенное оповещение."""
+        """
+        Этот корутин должен запускаться через asyncio.create_task(...).
+        Он регистрирует себя в scheduled_tasks по alert_key, выполняет sleep и отправляет.
+        """
 
+        # регистрируем задачу
+        self.scheduled_tasks[alert_key] = asyncio.current_task()
         try:
             logger.info(
-                f"Планирование {alert_type} через {int(delay_seconds // 60)} мин")
+                f"Планирование {alert_type} '{alert_key}' через {int(delay_seconds // 60)} мин")
             await asyncio.sleep(delay_seconds)
             self.send_alert(message, force=True, alert_key=alert_key)
             self.planned_alerts.discard(alert_key)
+            self.scheduled_tasks.pop(alert_key, None)
 
         except asyncio.CancelledError:
             logger.warning(f"Задача {alert_key} отменена")
+            self.scheduled_tasks.pop(alert_key, None)
+            self.planned_alerts.discard(alert_key)
         except Exception as e:
             logger.error(f"Ошибка в schedule_delayed_alert: {e}")
+            self.scheduled_tasks.pop(alert_key, None)
+            self.planned_alerts.discard(alert_key)
+
+    def cancel_planned_for_date(self, date_key: str):
+        """
+        Отменяет все запланированные оповещения и удаляет ключи отправленных сообщений,
+        содержащие date_key (строка вида 'dd.mm.YYYY').
+        """
+        logger.info(f"Отмена запланированных оповещений для {date_key}")
+        # отменяем задачи и удаляем ключи planned_alerts
+        for key in list(self.planned_alerts):
+            if date_key in key:
+                task = self.scheduled_tasks.pop(key, None)
+                if task and not task.done():
+                    task.cancel()
+                self.planned_alerts.discard(key)
+        # очищаем sent_keys связанные с этой датой (чтобы новые сообщения после изменения могли отправиться)
+        for k in list(self.sent_keys):
+            if date_key in k:
+                self.sent_keys.discard(k)
+        logger.info(f"Отмена завершена для {date_key}")

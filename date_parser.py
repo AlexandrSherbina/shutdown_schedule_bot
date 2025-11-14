@@ -4,41 +4,50 @@ from logger import logger
 
 
 class DateParser:
-    """Парсит дату графика из текста сообщения."""
+    """Парсит дату графика и время изменения из текста сообщения."""
 
     def __init__(self):
-        # Паттерны для поиска даты
-        self.date_patterns = [
-            # 12.11.2025
-            r'(?:За розпорядженням|графіка)\s+(\d{1,2})\.(\d{1,2})\.(\d{4})',
-            r'(\d{1,2})[._-](\d{1,2})[._-](\d{4})',  # универсальный
-            # словами
-            r'(?:на\s+)?(\d{1,2})\s+(?:листопада|novembre|november)\s+(\d{4})',
-        ]
+        # паттерн: "Зміни на 11:24 14.11.2025 ..." или "Зміни на 14.11.2025"
+        self.dt_pattern = re.compile(
+            r'Зміни\s+на\s+(\d{1,2}:\d{2})\s+(\d{1,2})\.(\d{1,2})\.(\d{4})', re.IGNORECASE)
+        self.date_pattern = re.compile(r'(\d{1,2})\.(\d{1,2})\.(\d{4})')
 
-    def parse_date(self, text: str) -> datetime | None:
-        """Извлекает дату графика из текста."""
+    def parse_date(self, text: str):
+        """
+        Возвращает кортеж (schedule_date: datetime.date, update_dt: datetime or None).
+        update_dt — время изменения в сообщении (локальное), если найдено.
+        """
+        # сначала пытаемся найти полный timestamp изменения
+        m = self.dt_pattern.search(text)
+        if m:
+            time_part, day, month, year = m.group(
+                1), m.group(2), m.group(3), m.group(4)
+            try:
+                update_dt = datetime.strptime(
+                    f"{day}.{month}.{year} {time_part}", "%d.%m.%Y %H:%M")
+                schedule_date = update_dt.date()
+                logger.info(
+                    f"Найдена дата графика {schedule_date} с временем обновления {update_dt}")
+                return schedule_date, update_dt
+            except Exception as e:
+                logger.debug(f"Не удалось распарсить update_dt: {e}")
 
-        for pattern in self.date_patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                try:
-                    groups = match.groups()
-                    day, month, year = int(groups[0]), int(
-                        groups[1]), int(groups[2])
+        # fallback: найти просто дату
+        m2 = self.date_pattern.search(text)
+        if m2:
+            day, month, year = int(m2.group(1)), int(
+                m2.group(2)), int(m2.group(3))
+            try:
+                schedule_date = datetime(year, month, day).date()
+                logger.info(
+                    f"Найдена дата графика {schedule_date} (без времени обновления)")
+                return schedule_date, None
+            except Exception as e:
+                logger.debug(f"Ошибка парсинга даты: {e}")
 
-                    schedule_date = datetime(year, month, day)
-                    logger.info(
-                        f"✓ Найдена дата графика: {schedule_date.strftime('%d.%m.%Y')}")
-                    return schedule_date
-
-                except (ValueError, IndexError) as e:
-                    logger.debug(f"Ошибка парсинга даты: {e}")
-                    continue
-
-        logger.warning(
-            "Дата графика не найдена в сообщении. Используется текущая дата.")
-        return datetime.now()
+        # если нечего найти — вернуть текущую дату
+        logger.warning("Дата графика не найдена, используется текущая дата")
+        return datetime.now().date(), None
 
     def is_schedule_valid(self, schedule_date: datetime) -> bool:
         """Проверяет, не устарел ли график."""

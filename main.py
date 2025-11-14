@@ -34,6 +34,8 @@ async def main():
     alert_manager = AlertManager(tg_config.bot_token, tg_config.chat_id)
 
     last_day = None  # Отслеживаем день для очистки кеша
+    # ключ: 'dd.mm.YYYY' -> datetime последнего обработанного обновления
+    last_schedule_updates = {}
 
     try:
         await tg_client.connect()
@@ -42,10 +44,11 @@ async def main():
 
         while True:
             try:
-                # ← НОВОЕ: Очищаем кеш в полночь
+                # очистка кеша в полночь
                 current_day = datetime.now().day
                 if last_day is not None and last_day != current_day:
                     alert_manager.clear_daily_cache()
+                    last_schedule_updates.clear()
                 last_day = current_day
 
                 messages = await tg_client.get_recent_messages(channel)
@@ -54,39 +57,58 @@ async def main():
                     if not message.message:
                         continue
 
-                    schedule_date = date_parser.parse_date(message.message)
+                    # parse_date теперь возвращает (schedule_date, update_dt)
+                    schedule_date, update_dt = date_parser.parse_date(
+                        message.message)
+                    date_key = schedule_date.strftime('%d.%m.%Y')
 
-                    if not date_parser.is_schedule_valid(schedule_date):
-                        logger.info(
-                            f"Пропускаем устаревший график (сообщение ID: {message.id})")
+                    # если уже есть сохранённое время обновления — сравниваем
+                    prev_update = last_schedule_updates.get(date_key)
+
+                    # если в сообщении нет времени обновления, считаем его "ненулевым" — обрабатываем только если нет prev_update
+                    if update_dt is None and prev_update is not None:
+                        # уже обработана более точная версия — пропускаем
+                        logger.debug(
+                            f"Пропускаем сообщение без времени обновления для {date_key} (уже есть обновление)")
                         continue
 
+                    # если есть предыдущее и текущее update_dt <= prev_update — пропускаем (старое сообщение)
+                    if update_dt is not None and prev_update is not None and update_dt <= prev_update:
+                        logger.debug(
+                            f"Пропускаем старое обновление для {date_key} ({update_dt} <= {prev_update})")
+                        continue
+
+                    # если пришло новое обновление (update_dt > prev_update) — нужно отменить старые планы для этой даты
+                    if prev_update is not None and (update_dt is None or update_dt > prev_update):
+                        logger.info(
+                            f"Найдено новое обновление графика для {date_key}. Отменяю старые планы.")
+                        alert_manager.cancel_planned_for_date(date_key)
+
+                    # сохраняем время последней обработки (если есть) - если нет, помечаем текущим временем
+                    last_schedule_updates[date_key] = update_dt or datetime.now(
+                    )
+
+                    # далее логика парсинга периодов и планирования (как раньше)
                     parser.set_schedule_date(schedule_date)
                     periods = parser.parse(message.message)
-
                     if not periods:
                         continue
 
                     logger.info(
-                        f"Найден график на {schedule_date.strftime('%d.%m.%Y')} (ID: {message.id})")
+                        f"Найден график на {date_key} (ID: {message.id})")
 
+                    # проверка текущего оффлай статуса и отправка одного сообщения
                     is_currently_offline = interval_checker.is_currently_offline(
                         [(p[0], p[1]) for p in periods]
                     )
-
                     if is_currently_offline:
                         current_period = interval_checker.get_current_offline_period(
                             [(p[0], p[1]) for p in periods]
                         )
                         if current_period:
-                            logger.warning(
-                                f"⚠️ СЕЙЧАС ОТКЛЮЧЕНЫ! Интервал: {current_period[0]}-{current_period[1]}")
+                            current_offline_key = f"CURRENT_OFFLINE_{date_key}_{current_period[0]}_{current_period[1]}"
                             msg = builder.current_offline_message(
-                                current_period[0], current_period[1]
-                            )
-                            # ← НОВОЕ: Используем уникальный ключ
-                            current_offline_key = f"CURRENT_OFFLINE_{schedule_date.strftime('%d.%m.%Y')}_{current_period[0]}_{current_period[1]}"
-
+                                current_period[0], current_period[1])
                             if alert_manager.send_alert(msg, alert_key=current_offline_key):
                                 logger.info(
                                     "Сообщение о текущем отключении отправлено")
