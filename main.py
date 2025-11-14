@@ -97,18 +97,23 @@ async def main():
                     logger.info(
                         f"Найден график на {date_key} (ID: {message.id})")
 
-                    # проверка текущего оффлай статуса и отправка одного сообщения
+                    # ← ИСПРАВЛЕННО: Передаём полные periods (с apply_date)
                     is_currently_offline = interval_checker.is_currently_offline(
-                        [(p[0], p[1]) for p in periods]
-                    )
+                        periods)
+
                     if is_currently_offline:
                         current_period = interval_checker.get_current_offline_period(
-                            [(p[0], p[1]) for p in periods]
-                        )
+                            periods)
                         if current_period:
-                            current_offline_key = f"CURRENT_OFFLINE_{date_key}_{current_period[0]}_{current_period[1]}"
+                            # ← current_period теперь (start, end, apply_date)
+                            period_start, period_end, apply_date = current_period
+                            apply_date_key = apply_date.strftime('%d.%m.%Y') if hasattr(
+                                apply_date, 'strftime') else str(apply_date)
+
+                            current_offline_key = f"CURRENT_OFFLINE_{apply_date_key}_{period_start}_{period_end}"
                             msg = builder.current_offline_message(
-                                current_period[0], current_period[1])
+                                period_start, period_end)
+
                             if alert_manager.send_alert(msg, alert_key=current_offline_key):
                                 logger.info(
                                     "Сообщение о текущем отключении отправлено")
@@ -151,33 +156,35 @@ async def process_period(alert_manager, builder, alert_config, interval_checker,
             f"Время {period_start} уже прошло для даты {schedule_date.strftime('%d.%m.%Y')}")
         return
 
+    # ← ИСПРАВЛЕННО: Передаём schedule_date в is_in_interval
     is_in_current_interval = interval_checker.is_in_interval(
-        period_start, period_end)
+        period_start, period_end, schedule_date)
 
     if is_in_current_interval:
         logger.info(
-            f"Мы находимся в интервале отключения {period_start}-{period_end}")
-    else:
-        # ← ОТКЛЮЧЕНИЕ (OFF)
-        off_alert_ts = start_ts - (alert_config.alert_minutes_before_off * 60)
-        if off_alert_ts > now_ts + constants.MIN_ALERT_DELAY:
-            off_key = f"OFF_{schedule_date.strftime('%d.%m.%Y')}_{period_start}_{period_end}"
-            if off_key not in alert_manager.planned_alerts:
-                off_time = time.strftime('%H:%M', time.localtime(off_alert_ts))
-                msg = builder.initial_off_message(
-                    period_start, period_end, off_time)
+            f"Мы находимся в интервале отключения {period_start}-{period_end} на {schedule_date.strftime('%d.%m.%Y')}")
+        return  # ← Пропускаем, не обрабатываем текущий интервал
 
-                # ← ПРОВЕРКА НА ДУБЛИКАТ с ключом
-                if alert_manager.send_alert(msg, alert_key=off_key):
-                    alert_manager.planned_alerts.add(off_key)
+    # ← ОТКЛЮЧЕНИЕ (OFF)
+    off_alert_ts = start_ts - (alert_config.alert_minutes_before_off * 60)
+    if off_alert_ts > now_ts + constants.MIN_ALERT_DELAY:
+        off_key = f"OFF_{schedule_date.strftime('%d.%m.%Y')}_{period_start}_{period_end}"
+        if off_key not in alert_manager.planned_alerts:
+            off_time = time.strftime('%H:%M', time.localtime(off_alert_ts))
+            msg = builder.initial_off_message(
+                period_start, period_end, off_time)
 
-                    final_msg = builder.final_off_message(
-                        period_start, period_end)
-                    delay = off_alert_ts - now_ts
-                    asyncio.create_task(
-                        alert_manager.schedule_delayed_alert(
-                            'OFF', delay, final_msg, off_key)
-                    )
+            # ← ПРОВЕРКА НА ДУБЛИКАТ с ключом
+            if alert_manager.send_alert(msg, alert_key=off_key):
+                alert_manager.planned_alerts.add(off_key)
+
+                final_msg = builder.final_off_message(
+                    period_start, period_end)
+                delay = off_alert_ts - now_ts
+                asyncio.create_task(
+                    alert_manager.schedule_delayed_alert(
+                        'OFF', delay, final_msg, off_key)
+                )
 
     # ← ВКЛЮЧЕНИЕ (ON)
     end_ts = time.mktime(time.strptime(
